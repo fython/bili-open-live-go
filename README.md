@@ -1,6 +1,8 @@
 bili-open-live-go
 ======
 
+[![godoc](https://godoc.org/github.com/fython/bili-open-live-go?status.svg)](https://pkg.go.dev/github.com/fython/bili-open-live-go)
+
 （非官方）基于哔哩哔哩[官方开放平台 API](https://open-live.bilibili.com/)实现的直播长连协议客户端 Golang 版本
 
 > 这个项目还在施工中，API 随时可能发生变化，欢迎有动手能力的小伙伴体验，更欢迎一起共建完善造福社区
