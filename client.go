@@ -7,18 +7,18 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"go.uber.org/zap"
 	"io"
-	"log"
 	"net/http"
 	"nhooyr.io/websocket"
 	"sync"
 	"time"
 )
 
+// clientState 直播客户端状态
 type clientState int
 
 const (
 	clientStateIdle clientState = iota
-	clientStateAlive
+	clientStateActive
 )
 
 // noCopy may be embedded into structs which must not be copied
@@ -42,6 +42,7 @@ type LiveClient struct {
 	ProjectID int64
 
 	OnDanmaku func(Danmaku)
+	OnClose   func(error)
 
 	noCopy noCopy
 
@@ -77,13 +78,14 @@ func (c *LiveClient) Connect(ctx context.Context, liveCode string) error {
 	}
 	c.liveCode = liveCode
 	c.client = &http.Client{
+		Timeout:   time.Second * 60,
 		Transport: ApiTransport{AppKey: c.AppKey, AppSecret: c.AppSecret},
 	}
 	// 调用 /v2/app/start 获取基本信息
 	if err := c.callAppStart(ctx); err != nil {
 		return fmt.Errorf("start app fail: %w", err)
 	}
-	c.clientState = clientStateAlive
+	c.clientState = clientStateActive
 	// 拿到基本信息后，自动建立 WebSocket 连接
 	if err := c.connectWs(ctx); err != nil {
 		return fmt.Errorf("connect ws fail: %w", err)
@@ -91,6 +93,7 @@ func (c *LiveClient) Connect(ctx context.Context, liveCode string) error {
 	return nil
 }
 
+// connectWs 连接 WebSocket
 func (c *LiveClient) connectWs(ctx context.Context) error {
 	if c.wsClient != nil {
 		if err := c.wsClient.Close(); err != nil {
@@ -102,6 +105,7 @@ func (c *LiveClient) connectWs(ctx context.Context) error {
 		url:       c.wsInfo.WSSLink[0],
 		authBody:  c.wsInfo.AuthBody,
 		onDanmaku: c.OnDanmaku,
+		onClose:   c.onWsClose,
 	}
 	if err := c.wsClient.connect(ctx); err != nil {
 		c.logger().Error("connect websocket fail", zap.Error(err),
@@ -111,22 +115,42 @@ func (c *LiveClient) connectWs(ctx context.Context) error {
 	return nil
 }
 
+// onWsClose 在 WebSocket 连接断线的时候一起触发 Disconnect 函数
+func (c *LiveClient) onWsClose(err error) {
+	if err := c.Disconnect(context.Background()); err != nil {
+		c.logger().Warn("disconnect fail", zap.Error(err))
+	}
+	if c.OnClose != nil {
+		c.OnClose(err)
+	}
+}
+
+// Disconnect 断开连接
 func (c *LiveClient) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.clientState == clientStateAlive {
+	defer func() {
+		c.clientState = clientStateIdle
+	}()
+	if c.clientState == clientStateActive {
 		if err := c.callAppEnd(ctx); err != nil {
-			log.Printf("failed to call app end: %+v", err)
+			c.logger().Warn("call app end fail", zap.Error(err))
 		}
 	}
 	if c.wsClient != nil {
+		defer func() {
+			c.wsClient = nil
+		}()
 		if err := c.wsClient.Close(); err != nil {
 			c.logger().Warn("close last websocket client fail", zap.Error(err))
 		}
-		c.wsClient = nil
 	}
-	c.clientState = clientStateIdle
 	return nil
+}
+
+// IsActive 检查客户端是否在线
+func (c *LiveClient) IsActive() bool {
+	return c.clientState == clientStateActive
 }
 
 func (c *LiveClient) commonCallApi(ctx context.Context, path string, req any, rsp any) error {
@@ -158,6 +182,7 @@ func (c *LiveClient) commonCallApi(ctx context.Context, path string, req any, rs
 	return nil
 }
 
+// callAppStart 开启游戏/项目，获取 WebSocket 连接节点和鉴权信息
 func (c *LiveClient) callAppStart(ctx context.Context) error {
 	req := map[string]any{"code": c.liveCode, "app_id": c.ProjectID}
 	var rsp CommonResponse[appStartData]
@@ -167,14 +192,14 @@ func (c *LiveClient) callAppStart(ctx context.Context) error {
 	if err := rsp.Err(); err != nil {
 		return err
 	}
-	log.Printf("%+v", rsp.Data)
 	c.gameID = rsp.Data.GameInfo.GameID
 	c.wsInfo = rsp.Data.WebsocketInfo
 	return nil
 }
 
+// callAppEnd 关闭游戏/项目，对于游戏类型的项目必须要调用这个，否则下次无法开启
 func (c *LiveClient) callAppEnd(ctx context.Context) error {
-	if c.clientState != clientStateAlive {
+	if c.clientState != clientStateActive {
 		return fmt.Errorf("client state should be alive")
 	}
 	if c.gameID == "" {
@@ -192,8 +217,9 @@ func (c *LiveClient) callAppEnd(ctx context.Context) error {
 	return nil
 }
 
+// callAppHeartbeat 发送心跳包
 func (c *LiveClient) callAppHeartbeat(ctx context.Context) error {
-	if c.clientState != clientStateAlive {
+	if c.clientState != clientStateActive {
 		return fmt.Errorf("client state should be alive")
 	}
 	if c.gameID == "" {
@@ -211,19 +237,24 @@ func (c *LiveClient) callAppHeartbeat(ctx context.Context) error {
 	return nil
 }
 
+// websocketClientState WebSocket 客户端状态
 type websocketClientState int
 
 const (
+	// websocketClientStateIdle 闲置，未连接
 	websocketClientStateIdle websocketClientState = iota
+	// websocketClientStateAuth 需要登录，可能正在登录中
 	websocketClientStateAuth
+	// websocketClientStateActive 已连接
 	websocketClientStateActive
 )
 
-// liveWebsocketClient 封装了长连 Websocket 协议
+// liveWebsocketClient 封装长连 Websocket 协议的客户端
 type liveWebsocketClient struct {
 	url       string
 	authBody  string
 	onDanmaku func(Danmaku)
+	onClose   func(error)
 
 	state           websocketClientState
 	conn            *websocket.Conn
@@ -278,14 +309,20 @@ func (c *liveWebsocketClient) connect(ctx context.Context) error {
 	return nil
 }
 
+// Close 主动关闭连接
 func (c *liveWebsocketClient) Close() error {
 	if c.conn == nil {
 		return nil
 	}
-	defer func() {
-		c.state = websocketClientStateIdle
-		c.conn = nil
-	}()
+	defer c.internalClose(nil)
+	if err := c.conn.Close(websocket.StatusNormalClosure, "client close"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// internalClose 回收连接相关的状态、上下文，并通知 onClose 回调，若为主动关闭则传入空失败区分
+func (c *liveWebsocketClient) internalClose(err error) {
 	if c.loopCancel != nil {
 		c.loopCancel()
 		c.loopCancel = nil
@@ -294,12 +331,14 @@ func (c *liveWebsocketClient) Close() error {
 		c.heartbeatTicker.Stop()
 		c.heartbeatTicker = nil
 	}
-	if err := c.conn.Close(websocket.StatusNormalClosure, "client close"); err != nil {
-		return err
+	c.state = websocketClientStateIdle
+	c.conn = nil
+	if c.onClose != nil {
+		c.onClose(err)
 	}
-	return nil
 }
 
+// readLoop WebSocket 数据流读取循环，反序列化出接口消息写入 channel 队列待处理
 func (c *liveWebsocketClient) readLoop() {
 	for {
 		if c.conn == nil {
@@ -308,6 +347,11 @@ func (c *liveWebsocketClient) readLoop() {
 		}
 		_, buf, err := c.conn.Read(context.Background())
 		if err != nil {
+			if closeStatus := websocket.CloseStatus(err); closeStatus != -1 {
+				c.logger().Info("connection receive close message", zap.Error(err))
+				c.internalClose(err)
+				return
+			}
 			c.logger().Warn("failed to read message from conn", zap.Error(err))
 			continue
 		}
@@ -321,6 +365,7 @@ func (c *liveWebsocketClient) readLoop() {
 	}
 }
 
+// eventLoop 接口消息消费循环
 func (c *liveWebsocketClient) eventLoop() {
 	for {
 		select {
